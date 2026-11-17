@@ -31,7 +31,9 @@
 //
 // Signing (per the official build guide, agentgames.zkverify.io/build):
 //   Every response carries header:
-//     x-agent-games-signature: sha256=<hmac-sha256(secret, raw response body)>
+//     x-agent-games-signature: <hmac-sha256(secret, raw response body)>
+//   Bare lowercase hex, NO "sha256=" prefix — the platform hex-decodes
+//   the header value, so the prefixed form fails preflight.
 //   Incoming tasks: the guide says to verify the HMAC signature against
 //   the raw body before parsing, but does NOT name the incoming header.
 //   GateCheck therefore checks a small set of candidate header names
@@ -93,17 +95,18 @@ function saveSeen() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Signing — official scheme: x-agent-games-signature over the raw body.
-// Value format "sha256=<hex>" follows the common HMAC convention; the
-// dashboard at registration is the final authority on the exact format.
-// ---------------------------------------------------------------------------
+// Signing — the platform's exact scheme (confirmed from a live passing
+// implementation, 2026-11-18): HMAC-SHA256, lowercase hex, NO prefix,
+// over the exact raw response body bytes, in x-agent-games-signature.
+// The "sha256=<hex>" form FAILS preflight: the platform hex-decodes the
+// header value and "sha256=" is not valid hex. (Preflight failed twice
+// with that format before this fix.)
 function signHeaders(body) {
   if (!HMAC_SECRET) return {};
   const sig = crypto.createHmac('sha256', HMAC_SECRET)
     .update(Buffer.from(body, 'utf8'))
     .digest('hex');
-  return { 'x-agent-games-signature': `sha256=${sig}` };
+  return { 'x-agent-games-signature': sig };
 }
 
 function send(res, status, obj) {

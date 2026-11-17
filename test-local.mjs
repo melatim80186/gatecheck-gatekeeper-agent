@@ -22,12 +22,13 @@ function check(name, cond, extra = '') {
   else { failed++; console.log(`  FAIL ${name} ${extra}`); }
 }
 
-// Independent signature verification: HMAC-SHA256(secret, raw body).
+// Independent signature verification: HMAC-SHA256(secret, raw body),
+// bare lowercase hex, no prefix (platform's exact scheme).
 async function verifySig(res, rawText) {
   const header = res.headers.get('x-agent-games-signature');
-  if (!header || !header.startsWith('sha256=')) return false;
+  if (!header || !/^[0-9a-f]{64}$/.test(header)) return false;
   const expected = crypto.createHmac('sha256', SECRET).update(Buffer.from(rawText, 'utf8')).digest('hex');
-  return header === `sha256=${expected}`;
+  return header === expected;
 }
 
 async function postTask(payload, { rawBody = null, signed = true } = {}) {
@@ -35,7 +36,7 @@ async function postTask(payload, { rawBody = null, signed = true } = {}) {
   const headers = { 'content-type': 'application/json' };
   if (signed) {
     headers['x-agent-games-signature'] =
-      'sha256=' + crypto.createHmac('sha256', SECRET).update(Buffer.from(body, 'utf8')).digest('hex');
+      crypto.createHmac('sha256', SECRET).update(Buffer.from(body, 'utf8')).digest('hex');
   }
   const res = await fetch(`${BASE}/task`, { method: 'POST', headers, body });
   const text = await res.text();
