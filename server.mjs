@@ -17,8 +17,15 @@
 //                      the platform-generated value — never a placeholder.
 //
 // Endpoints:
-//   GET  /         agent card
-//   GET  /health   preflight health check -> {"ok":true,...}
+//   GET  /         protocol-v1 health check -> {"ok":true,"protocolVersion":"v1"}
+//                   (the platform preflights the registered endpoint with a
+//                   GET and requires exactly this signed JSON — see the
+//                   preflight error 2026-11-18: the agent card used to live
+//                   here and failed the check for a missing protocolVersion)
+//   GET  /health   same protocol-v1 health check
+//   GET  /agent    same protocol-v1 health check (in case the endpoint was
+//                   registered with the /agent path)
+//   GET  /info     agent card (human-readable, was GET / before the fix)
 //   POST /         task payload -> decision JSON
 //   POST /task     same as POST /
 //
@@ -260,7 +267,12 @@ async function handleTask(req, res) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = req.url.split('?')[0];
-    if (req.method === 'GET' && url === '/') {
+    // Protocol-v1 health check: the platform GETs the registered endpoint
+    // (root, /health, or /agent) and requires exactly this signed JSON.
+    if (req.method === 'GET' && (url === '/' || url === '/health' || url === '/agent')) {
+      return send(res, 200, { ok: true, protocolVersion: 'v1' });
+    }
+    if (req.method === 'GET' && url === '/info') {
       return send(res, 200, {
         agent: 'GateCheck',
         track: 'zkVerify Agent Games — Proof Gatekeeper',
@@ -271,9 +283,6 @@ const server = http.createServer(async (req, res) => {
         proofs: 'none — decisions are returned WITHOUT a Groth16 proof (see README: scoring caveat, -2 per provable task, reliability bonus forfeited)',
         seen_proofs: seen.size,
       });
-    }
-    if (req.method === 'GET' && url === '/health') {
-      return send(res, 200, { ok: true, agent: 'GateCheck', ts: new Date().toISOString() });
     }
     if (req.method === 'POST' && (url === '/' || url === '/task')) {
       return handleTask(req, res);

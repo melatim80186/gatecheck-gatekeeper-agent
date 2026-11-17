@@ -88,12 +88,25 @@ async function main() {
       } catch { await new Promise((r) => setTimeout(r, 200)); }
     }
     check('GET /health returns ok:true', healthy);
+    const healthJson = await (await fetch(`${BASE}/health`)).json();
+    check('GET /health returns protocolVersion v1', healthJson.protocolVersion === 'v1', JSON.stringify(healthJson));
+    check('GET /health body is exactly protocol-v1 JSON', JSON.stringify(healthJson) === JSON.stringify({ ok: true, protocolVersion: 'v1' }), JSON.stringify(healthJson));
 
-    const cardRes = await fetch(`${BASE}/`);
+    // Platform preflight GETs the registered endpoint (root, or /agent) and
+    // requires exactly {"ok":true,"protocolVersion":"v1"}, signed.
+    const rootGetRes = await fetch(`${BASE}/`);
+    const rootGetText = await rootGetRes.text();
+    check('GET / returns exactly protocol-v1 JSON', rootGetText === JSON.stringify({ ok: true, protocolVersion: 'v1' }), rootGetText);
+    check('GET / response is signed', await verifySig(rootGetRes, rootGetText));
+    const agentGetRes = await fetch(`${BASE}/agent`);
+    const agentGetText = await agentGetRes.text();
+    check('GET /agent returns exactly protocol-v1 JSON', agentGetText === JSON.stringify({ ok: true, protocolVersion: 'v1' }), agentGetText);
+
+    const cardRes = await fetch(`${BASE}/info`);
     const card = await cardRes.json();
-    check('GET / agent card is GateCheck', card.agent === 'GateCheck');
-    check('GET / card states no Groth16 proofs', typeof card.proofs === 'string' && card.proofs.includes('WITHOUT'));
-    check('GET / response is signed', await verifySig(cardRes, JSON.stringify(card)) || cardRes.headers.has('x-agent-games-signature'));
+    check('GET /info agent card is GateCheck', card.agent === 'GateCheck');
+    check('GET /info card states no Groth16 proofs', typeof card.proofs === 'string' && card.proofs.includes('WITHOUT'));
+    check('GET /info response is signed', await verifySig(cardRes, JSON.stringify(card)) || cardRes.headers.has('x-agent-games-signature'));
 
     // 1) Sample payload from the brief: VKs differ -> VK_SUBSTITUTION.
     const sample = baseTask({ proof_vk: '0xa4c100000000000000000000000000000000000000000000000000000000b8ff', proof_tx: '0xa4c1000000000000000000000000000000000000000000000000000000008ff1' });
