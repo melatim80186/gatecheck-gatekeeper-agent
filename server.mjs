@@ -26,8 +26,19 @@
 //   GET  /agent    same protocol-v1 health check (in case the endpoint was
 //                   registered with the /agent path)
 //   GET  /info     agent card (human-readable, was GET / before the fix)
-//   POST /         task payload -> decision JSON
+//   POST /         task payload -> decision JSON, EXCEPT a preflight
+//                   envelope {"type":"agent-games.preflight.v1"}, which is
+//                   answered {"ok":true,"protocolVersion":"v1"} (signed).
+//                   The platform preflights with a POST envelope, NOT a GET:
+//                   fix 1 (GET body) and fix 2 (bare-hex signature) were
+//                   both necessary but not sufficient — a preflight POST
+//                   used to fall through to decide() and come back REJECT
+//                   VK_SUBSTITUTION, which the platform reads as a protocol
+//                   failure. (Confirmed from a live passing implementation,
+//                   2026-11-18.)
 //   POST /task     same as POST /
+//   POST /agent    same as POST / (in case the endpoint was registered
+//                   with the /agent path)
 //
 // Signing (per the official build guide, agentgames.zkverify.io/build):
 //   Every response carries header:
@@ -249,6 +260,15 @@ async function handleTask(req, res) {
     return send(res, 200, { decision: 'REJECT', reason_code: 'VK_SUBSTITUTION', proof_tx: null });
   }
 
+  // Preflight handshake: the platform POSTs {"type":"agent-games.preflight.v1"}
+  // to the registered endpoint and requires {"ok":true,"protocolVersion":"v1"},
+  // signed. This must be answered BEFORE decide() — a preflight envelope has
+  // no input, so decide() would fail it closed as VK_SUBSTITUTION.
+  if (typeof task.type === 'string' && task.type.startsWith('agent-games.preflight')) {
+    console.log(`[${new Date().toISOString()}] preflight handshake answered (type=${task.type}) incoming_sig=${incoming.detail}`);
+    return send(res, 200, { ok: true, protocolVersion: 'v1' });
+  }
+
   let out;
   try {
     out = decide(task);
@@ -287,7 +307,7 @@ const server = http.createServer(async (req, res) => {
         seen_proofs: seen.size,
       });
     }
-    if (req.method === 'POST' && (url === '/' || url === '/task')) {
+    if (req.method === 'POST' && (url === '/' || url === '/task' || url === '/agent')) {
       return handleTask(req, res);
     }
     return send(res, 404, { decision: 'REJECT', reason_code: 'VK_SUBSTITUTION', proof_tx: null });

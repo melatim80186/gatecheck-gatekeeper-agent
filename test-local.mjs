@@ -109,6 +109,20 @@ async function main() {
     check('GET /info card states no Groth16 proofs', typeof card.proofs === 'string' && card.proofs.includes('WITHOUT'));
     check('GET /info response is signed', await verifySig(cardRes, JSON.stringify(card)) || cardRes.headers.has('x-agent-games-signature'));
 
+    // Preflight handshake: the platform POSTs {"type":"agent-games.preflight.v1"}
+    // and requires exactly {"ok":true,"protocolVersion":"v1"}, signed.
+    // (This is the real preflight — a GET-only fix is not enough.)
+    for (const p of ['/', '/task', '/agent']) {
+      const pfRes = await fetch(`${BASE}${p}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'agent-games.preflight.v1' }),
+      });
+      const pfText = await pfRes.text();
+      check(`POST ${p} preflight envelope -> protocol-v1 JSON`, pfText === JSON.stringify({ ok: true, protocolVersion: 'v1' }), pfText);
+      check(`POST ${p} preflight response is signed`, await verifySig(pfRes, pfText));
+    }
+
     // 1) Sample payload from the brief: VKs differ -> VK_SUBSTITUTION.
     const sample = baseTask({ proof_vk: '0xa4c100000000000000000000000000000000000000000000000000000000b8ff', proof_tx: '0xa4c1000000000000000000000000000000000000000000000000000000008ff1' });
     let r = await postTask(sample);
