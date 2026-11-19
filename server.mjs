@@ -1,10 +1,7 @@
 // GateCheck — zkVerify Agent Games, Proof Gatekeeper track
 // A deterministic gatekeeper: it checks the task payload's own fields
-// against the registered condition and returns APPROVE / REJECT, with a
-// Groth16 proof of the decision (snarkjs + official gatekeeper circuit)
-// attached when provable. When proving fails, the decision is returned
-// WITHOUT a proof — a correct proof-less decision still scores +10,
-// while an attached bad proof would score -2.
+// against the registered condition and returns APPROVE / REJECT.
+// No Groth16 proof is generated or attached (see README — scoring caveat).
 //
 // Node 22 stdlib only — no dependencies, runs anywhere (Render, Fly.io,
 // Railway, any VPS). No private keys, no wallet, no funds, no outbound
@@ -77,27 +74,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { groth16 } from 'snarkjs';
-import jsSha3 from 'js-sha3';
-const { keccak256 } = jsSha3;
 
 const PORT = Number(process.env.PORT || 8080);
 const HMAC_SECRET = process.env.AGENT_HMAC_SECRET || '';
 const SEEN_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'seen.json');
 const MAX_BODY = 65536;
-
-// Groth16 proof pipeline (added 2026-11-19): official gatekeeper circuit
-// artifacts live in circuits/ (wasm + zkey, sha256-verified). If either
-// file is missing, proofs are silently disabled and the agent keeps
-// answering proof-less decisions (the pre-pipeline behavior).
-const CIRCUIT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'circuits');
-const WASM_PATH = path.join(CIRCUIT_DIR, 'gatekeeper.wasm');
-const ZKEY_PATH = path.join(CIRCUIT_DIR, 'gatekeeper_final.zkey');
-// bn128 field prime — every circuit input is a field element.
-const FIELD_PRIME = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
-// Hard cap for proving, well inside the platform's 60 s response deadline.
-const PROVE_TIMEOUT_MS = 20000;
-const PROOFS_ENABLED = fs.existsSync(WASM_PATH) && fs.existsSync(ZKEY_PATH);
 
 // ---------------------------------------------------------------------------
 // Seen-set: proof_tx values accepted in earlier APPROVE decisions.
@@ -240,124 +221,6 @@ function decide(task) {
 }
 
 // ---------------------------------------------------------------------------
-// Groth16 proof pipeline (added 2026-11-19 — R06 scored 8/8 correct at
-// +10 each without proofs; a valid proof lifts each correct decision to
-// +12 and counts toward the reliability bonus).
-//
-// Circuit: official gatekeeper circuit (GatekeeperEvaluation_79, 647
-// witness signals, 13 public signals), Groth16/BN128, artifacts in
-// circuits/. Input signal names and encodings were recovered by probing
-// the compiled WASM and validated by reproducing a published test vector
-// EXACTLY (12 of 13 public signals identical, Poseidon commitment
-// formula verified with circomlibjs):
-//   registeredVkHash / proofVkHash : BigInt(hex VK string) mod p
-//     (the task's VK fields ARE verification-key hashes — fed directly,
-//     NOT hashed again)
-//   minimum / publicBalance / expiryBlock / currentBlock / amount /
-//   maxTransfer : plain integers from the task fields
-//   recipient / conditionRecipient : plain integers from the hex address
-//   decision : 1 = APPROVE, 0 = REJECT
-//   taskId : keccak256(task_id ASCII string) mod p
-//   salt : random private field element (never leaves the prover)
-// Public signals: [Poseidon(salt, taskId) commitment, registeredVkHash,
-// proofVkHash, minimum, publicBalance, expiryBlock, currentBlock,
-// recipient, conditionRecipient, amount, maxTransfer, decision, taskId].
-// Response shape (per the official starter prompt on /build):
-//   { decision, reason_code, proof, public_signals }
-// where proof is the raw snarkjs Groth16 proof object and public_signals
-// is the 13-element array of decimal strings.
-//
-// The circuit enforces decision == the computed verdict: a proof can
-// only be built for the CORRECT decision. A wrong decision cannot even
-// build a witness (assert at GatekeeperEvaluation_79 line 102), so
-// proving a decision the circuit disagrees with THROWS — caught below
-// and falls back to the proof-less response. The one systematic case:
-// PROOF_REUSED rejections (all circuit checks pass, but the decision
-// must be REJECT) can never be proven — they always fall back.
-// ---------------------------------------------------------------------------
-function hexToField(hexStr) {
-  if (typeof hexStr !== 'string' || !/^0x[0-9a-fA-F]+$/.test(hexStr.trim())) {
-    throw new Error(`not a hex value: ${String(hexStr).slice(0, 20)}`);
-  }
-  return BigInt(hexStr.trim()) % FIELD_PRIME;
-}
-
-function fieldFromBig(v, name) {
-  if (v === null || v < 0n || v >= FIELD_PRIME) throw new Error(`field out of range: ${name}`);
-  return v;
-}
-
-function buildCircuitInput(task, decision) {
-  const input = (task && typeof task === 'object' &&
-    task.input && typeof task.input === 'object') ? task.input : {};
-  const regVk = typeof input.registered_vk === 'string' ? input.registered_vk : '';
-  const proofVk = typeof input.proof_vk === 'string' ? input.proof_vk : '';
-  // Addresses parse as field elements as-is (any length of valid hex);
-  // hexToField/fieldFromBig below throw on malformed or out-of-range
-  // values, and the caller falls back to the proof-less response.
-  const recip = normAddr(input.recipient);
-  const condRecip = normAddr(input.condition_recipient);
-  if (typeof task.task_id !== 'string' || !task.task_id) {
-    throw new Error('missing task_id');
-  }
-  const min = toBig(input.minimum);
-  const bal = toBig(input.public_balance);
-  const exp = toBig(input.expiry_block);
-  const cur = toBig(input.current_block);
-  const amt = toBig(input.amount);
-  const max = toBig(input.max_transfer);
-  // Random private salt (field element, never 0).
-  let salt = 0n;
-  for (let i = 0; i < 5 && salt === 0n; i++) {
-    salt = BigInt('0x' + crypto.randomBytes(32).toString('hex')) % FIELD_PRIME;
-  }
-  if (salt === 0n) throw new Error('could not sample a non-zero salt');
-  return {
-    registeredVkHash: hexToField(regVk).toString(),
-    proofVkHash: hexToField(proofVk).toString(),
-    minimum: fieldFromBig(min, 'minimum').toString(),
-    publicBalance: fieldFromBig(bal, 'public_balance').toString(),
-    expiryBlock: fieldFromBig(exp, 'expiry_block').toString(),
-    currentBlock: fieldFromBig(cur, 'current_block').toString(),
-    recipient: fieldFromBig(hexToField(recip), 'recipient').toString(),
-    conditionRecipient: fieldFromBig(hexToField(condRecip), 'condition_recipient').toString(),
-    amount: fieldFromBig(amt, 'amount').toString(),
-    maxTransfer: fieldFromBig(max, 'max_transfer').toString(),
-    decision: decision === 'APPROVE' ? '1' : '0',
-    taskId: (BigInt('0x' + keccak256(task.task_id)) % FIELD_PRIME).toString(),
-    salt: salt.toString(),
-  };
-}
-
-// Best-effort proving: returns { proof, publicSignals } or null.
-// NEVER throws. Any failure (unbuildable input, witness assert, proving
-// error, timeout) returns null and the caller sends the proof-less
-// decision — a correct proof-less decision still scores +10, while an
-// attached bad proof would score -2.
-async function proveDecision(task, decision, taskId) {
-  if (!PROOFS_ENABLED) return null;
-  let input;
-  try {
-    input = buildCircuitInput(task, decision);
-  } catch (e) {
-    console.log(`[${new Date().toISOString()}] task_id=${taskId} proof skipped (input unbuildable: ${e.message})`);
-    return null;
-  }
-  try {
-    const t0 = Date.now();
-    const { proof, publicSignals } = await Promise.race([
-      groth16.fullProve(input, WASM_PATH, ZKEY_PATH),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('prove timeout')), PROVE_TIMEOUT_MS)),
-    ]);
-    console.log(`[${new Date().toISOString()}] task_id=${taskId} proof built in ${Date.now() - t0} ms (decision=${decision})`);
-    return { proof, publicSignals };
-  } catch (e) {
-    console.log(`[${new Date().toISOString()}] task_id=${taskId} proof skipped (${e.message})`);
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 function readRawBody(req) {
@@ -420,17 +283,8 @@ async function handleTask(req, res) {
     saveSeen();
   }
 
-  // Groth16 proof (best-effort, never blocks or changes the decision).
-  const taskId = task.task_id || '?';
-  const proved = await proveDecision(task, out.decision, taskId);
-  const response = { ...out };
-  if (proved) {
-    response.proof = proved.proof;
-    response.public_signals = proved.publicSignals;
-  }
-
-  console.log(`[${new Date().toISOString()}] task_id=${taskId} mode=${task.mode || '?'} decision=${out.decision} reason=${out.reason_code} proof_tx=${out.proof_tx} proof=${proved ? 'attached' : 'none'} incoming_sig=${incoming.detail}`);
-  return send(res, 200, response);
+  console.log(`[${new Date().toISOString()}] task_id=${task.task_id || '?'} mode=${task.mode || '?'} decision=${out.decision} reason=${out.reason_code} proof_tx=${out.proof_tx} incoming_sig=${incoming.detail}`);
+  return send(res, 200, out);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -449,7 +303,7 @@ const server = http.createServer(async (req, res) => {
         endpoints: ['GET /health', 'POST / {task}', 'POST /task {task}'],
         signed: Boolean(HMAC_SECRET),
         signature_header: 'x-agent-games-signature',
-        proofs: 'Groth16 proof attached when provable (snarkjs + official gatekeeper circuit, circuits/); falls back to a proof-less decision when proving fails (correct proof-less decision scores +10, an attached bad proof would score -2)',
+        proofs: 'none — decisions are returned WITHOUT a Groth16 proof (see README: scoring caveat, -2 per provable task, reliability bonus forfeited)',
         seen_proofs: seen.size,
       });
     }
@@ -464,5 +318,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`GateCheck listening on ${PORT} (signed=${Boolean(HMAC_SECRET)}, seen=${seen.size}, proofs=${PROOFS_ENABLED ? 'enabled' : 'DISABLED — circuit files missing'})`);
+  console.log(`GateCheck listening on ${PORT} (signed=${Boolean(HMAC_SECRET)}, seen=${seen.size})`);
 });

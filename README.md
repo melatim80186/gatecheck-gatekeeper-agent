@@ -32,42 +32,23 @@ calls, no wallet, no keys.
 `THRESHOLD_MISMATCH`) and never crashes or times out. Every decision is
 logged to stdout as `task_id, mode, decision, reason_code, proof_tx`.
 
-## Groth16 proof pipeline (added 2026-11-19)
+## Scoring caveat — NO Groth16 proof (read this first)
 
-GateCheck now returns a Groth16 proof of every provable decision:
-`{ decision, reason_code, proof_tx, proof, public_signals }` — the raw
-snarkjs proof object plus the 13 public signals, per the official
-starter prompt on `/build`. Per the event scoring:
+**GateCheck returns decisions WITHOUT a Groth16 proof.** No proof is
+generated, and no proof fields are faked — inventing one would be worse
+than omitting it. Per the event scoring:
 
-- correct APPROVE/REJECT with a valid proof: **+12**
-- correct APPROVE/REJECT without a valid proof: **+10** (extra −2)
+- correct APPROVE/REJECT: **+12**
 - incorrect APPROVE: **−6** · incorrect REJECT: **−3** · timeout: **−2**
-- an attached proof that fails to verify: **−2**
+- **a correct decision without a valid Groth16 proof costs an extra −2
+  and earns no reliability bonus.**
 
-The proof step is best-effort with a 20 s internal timeout and NEVER
-changes the decision: if proving fails for any reason (witness assert,
-unbuildable input, timeout), the decision is returned WITHOUT proof
-fields — a correct proof-less decision still scores +10, while an
-attached bad proof would score −2. The circuit enforces
-decision == the computed verdict, so a wrong decision cannot even
-build a witness. The one systematic fallback: PROOF_REUSED rejections
-(all circuit checks pass, decision must be REJECT) can never be
-proven — they always go out proof-less.
-
-Circuit inputs (recovered by probing the compiled WASM, validated by
-reproducing a published test vector exactly): `registeredVkHash` /
-`proofVkHash` = BigInt(hex VK) mod p (the task VK fields ARE hashes,
-fed directly); `minimum`, `publicBalance`, `expiryBlock`,
-`currentBlock`, `amount`, `maxTransfer` = plain integers; `recipient` /
-`conditionRecipient` = plain integer addresses; `decision` 1/0;
-`taskId` = keccak256(task_id) mod p; `salt` = random private field
-element. Artifacts in `circuits/` (wasm 1,755,820 B + zkey 309,750 B,
-sha256-verified). Proving takes ~0.3–0.8 s locally.
-
-NOT done: on-chain submission of proofs via Kurier (needed for the
-"verified proofs" count and the reliability bonus). That needs a Kurier
-API key and is a separate step — the response proof alone earns the
-+12.
+So a correct GateCheck decision scores **+10** instead of +12, and the
+reliability bonus is forfeited. This is accepted for Rounds 04–08 while
+the proof pipeline (Circom circuit + `.zkey`/WASM from
+`/api/circuit-info`, local proving with `snarkjs`, Kurier submission)
+is still unbuilt. Adding real proofs later is the single biggest
+scoring upgrade available — it is a separate build, not a config tweak.
 
 ## Signing (official build guide)
 
@@ -106,8 +87,7 @@ and 5 rounds left, the in-memory set is enough for a single run.
 
 | File | What it is |
 |------|-----------|
-| `server.mjs` | The agent. Node 22 + snarkjs + js-sha3. |
-| `circuits/` | Official gatekeeper circuit artifacts: `gatekeeper.wasm`, `gatekeeper_final.zkey`, `verification_key.json` (exported from the zkey; used by the test suite). |
+| `server.mjs` | The agent. Node 22 stdlib only, no dependencies. |
 | `package.json` | `npm start` → `node server.mjs`; `npm test` → local test suite. |
 | `render.yaml` | Render free web service `gatecheck`; `AGENT_HMAC_SECRET` via `sync: false`. |
 | `seen.json` | Persisted seen-set (starts empty: `[]`). |
@@ -159,8 +139,7 @@ curl -X POST http://127.0.0.1:8080/task -H 'content-type: application/json' \
 
 ## What this agent does NOT do
 
-- No on-chain (Kurier) proof submission — the response proof earns +12;
-  the reliability bonus needs a Kurier API key (separate step).
+- No Groth16 proof generation (see scoring caveat above).
 - No on-chain calls, no wallet, no funds, no outbound network.
 - No GitHub repo, no deployment, no dashboard registration — those are
   separate, user-side steps.
