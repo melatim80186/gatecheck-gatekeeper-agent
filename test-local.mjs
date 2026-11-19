@@ -8,6 +8,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { groth16 } from 'snarkjs';
+import jsSha3 from 'js-sha3';
+const { keccak256 } = jsSha3;
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 18099;
@@ -106,7 +109,7 @@ async function main() {
     const cardRes = await fetch(`${BASE}/info`);
     const card = await cardRes.json();
     check('GET /info agent card is GateCheck', card.agent === 'GateCheck');
-    check('GET /info card states no Groth16 proofs', typeof card.proofs === 'string' && card.proofs.includes('WITHOUT'));
+    check('GET /info card states Groth16 proofs attached when provable', typeof card.proofs === 'string' && card.proofs.includes('attached when provable'));
     check('GET /info response is signed', await verifySig(cardRes, JSON.stringify(card)) || cardRes.headers.has('x-agent-games-signature'));
 
     // Preflight handshake: the platform POSTs {"type":"agent-games.preflight.v1"}
@@ -194,6 +197,35 @@ async function main() {
     });
     const rootJson = await rootRes.json();
     check('POST / accepts tasks', rootJson.decision === 'APPROVE' && rootJson.reason_code === 'VALID_CONDITION', JSON.stringify(rootJson));
+
+    // 13) Groth16 proof pipeline (added 2026-11-19).
+    const vk = JSON.parse(fs.readFileSync(path.join(DIR, 'circuits', 'verification_key.json'), 'utf8'));
+    const P = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+    async function verifyProof(resp) {
+      if (!resp.proof || !Array.isArray(resp.public_signals) || resp.public_signals.length !== 13) return false;
+      return await groth16.verify(vk, resp.public_signals, resp.proof);
+    }
+    // 13a) Valid payload -> APPROVE + proof that verifies.
+    // (baseTask spreads overrides into `input`, so set the top-level
+    // task_id explicitly — that is the value the circuit hashes.)
+    const pTask = { ...baseTask({ proof_tx: '0xpro1000000000000000000000000000000000000000000000000000000001' }), task_id: 'gk_proof_valid' };
+    const proveT0 = Date.now();
+    r = await postTask(pTask);
+    console.log(`  proof round-trip took ${Date.now() - proveT0} ms (includes HTTP)`);
+    check('valid payload -> APPROVE with proof', r.json.decision === 'APPROVE' && !!r.json.proof && Array.isArray(r.json.public_signals), JSON.stringify(r.json).slice(0, 200));
+    check('proof response is signed', r.sigOk);
+    check('proof verifies against official vk', await verifyProof(r.json));
+    check('publicSignals[11] is decision 1', r.json.public_signals && r.json.public_signals[11] === '1', JSON.stringify(r.json.public_signals));
+    check('publicSignals[12] is keccak256(task_id) mod p', r.json.public_signals && r.json.public_signals[12] === (BigInt('0x' + keccak256('gk_proof_valid')) % P).toString(), JSON.stringify(r.json.public_signals && r.json.public_signals[12]));
+    // 13b) Trap payload -> REJECT + proof that verifies (decision 0).
+    const trapTask = { ...baseTask({ proof_tx: '0xtra1000000000000000000000000000000000000000000000000000000001', condition_recipient: '0xBEEF00000000000000000000000000000000000001' }), task_id: 'gk_proof_trap' };
+    r = await postTask(trapTask);
+    check('trap payload -> REJECT with proof', r.json.decision === 'REJECT' && r.json.reason_code === 'RECIPIENT_MISMATCH' && !!r.json.proof, JSON.stringify(r.json).slice(0, 200));
+    check('trap proof verifies against official vk', await verifyProof(r.json));
+    check('trap publicSignals[11] is decision 0', r.json.public_signals && r.json.public_signals[11] === '0');
+    // 13c) Re-post the valid payload -> REJECT PROOF_REUSED with NO proof (fallback).
+    r = await postTask(pTask);
+    check('re-post -> REJECT PROOF_REUSED without proof', r.json.decision === 'REJECT' && r.json.reason_code === 'PROOF_REUSED' && !r.json.proof && !r.json.public_signals, JSON.stringify(r.json).slice(0, 200));
 
     console.log(`\n${passed} passed, ${failed} failed`);
   } finally {
